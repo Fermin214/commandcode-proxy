@@ -88,6 +88,8 @@ commandcode/
 | `CC_MAX_TOOL_IMAGE_MB` | `6` | Total per-request budget for tool screenshots (base64); older ones become a placeholder; `0` disables. See [Tool screenshot budget](#tool-screenshot-budget) |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout; see [Upstream idle timeouts](#upstream-idle-timeouts) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout |
+| `CC_UPSTREAM_RETRY_MAX` | `2` | Retries for upstream disconnects **before any byte is written downstream**; `0` disables; see [Upstream transient retry](#upstream-transient-retry) |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | Backoff base in ms; the actual delay is base × attempt number |
 | `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503`; see [In-flight cap](#in-flight-cap-optional) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | unset (disabled) | Drop the client once downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | Backend keep-alive timeout (`headersTimeout` is set to +1s automatically). **Must be larger than the reverse proxy's keepalive_timeout** — see [keep-alive ordering](#suggested-nginx-front) |
@@ -608,6 +610,50 @@ CC_STREAM_IDLE_MS=300000 npm start      # 5 minutes
 ```
 
 > ⚠️ A false kill costs more than one failed request: the abort returns `429 + retry_after`, the SDK retries automatically, and a retry **resends the entire context** — so each false kill re-pays the full prefill on long conversations.
+
+## Upstream Transient Retry
+
+The CC upstream sometimes kills a connection mid-stream at peak hours (peer RST/FIN), which surfaces in Node as
+`TypeError: terminated`. Before this change the proxy handed that straight to the client as
+`502 {"error":{"message":"Upstream error: terminated","type":"proxy_error"}}`.
+
+As long as **no byte has been written downstream yet**, the request never started from the client's point of view —
+so the proxy can absorb the blip internally instead of making the client eat a 502 and resend its whole context.
+
+- **Retry requires all four**: ① the upstream did not finish — either a transport-level drop (`terminated` /
+  `ECONNRESET` / `ECONNREFUSED` / `EPIPE` / `ETIMEDOUT` / `UND_ERR_SOCKET` / `socket hang up` / `other side closed` /
+  `fetch failed`), or a **clean peer FIN that carried no `finish` event at all** (the same class of truncation as an
+  RST); ② nothing written downstream yet (streaming: no header/event emitted; non-streaming: `headersSent` still
+  false); ③ the client is still connected; ④ the retry cap is not reached.
+- Once any header or event has gone downstream, the proxy **never retries** — the semantics are already committed and a
+  retry would duplicate text.
+- `STREAM_IDLE_TIMEOUT` (the `429` "reduce your context" signal) is deliberately passed through and is **never retried**.
+- If an upstream `error` event (`429` / `503` …) has already been parsed, the proxy does **not** retry, and if the
+  connection then drops it still surfaces that semantic error instead of overwriting it with a transport `502`
+  (reporting "upstream at capacity" as "the proxy broke" would be misleading).
+- A client that disconnects during the backoff abandons the retry — the client is gone, another upstream call would
+  only burn quota.
+- Retries are invisible to the client: it sees a single `200` whose body comes from the attempt that succeeded.
+
+| Env var | Default | Description |
+|---|---|---|
+| `CC_UPSTREAM_RETRY_MAX` | `2` | Max retries (3 attempts in total); `0` disables the behaviour |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | Backoff base in ms; the actual delay is base × attempt number |
+
+Logs to look for: `Upstream stream terminated before first byte - retrying` / `Upstream error before first byte - retrying` /
+`Upstream stream ended incomplete before first byte - retrying` (a retry happened; `attempt` / `maxAttempts` / `cause`
+or `reason` are in the structured fields), `Upstream retry recovered` (the retry **actually delivered** a normal
+response) and `Upstream retry abandoned (client disconnected during backoff)`. The startup banner's `upstreamRetry`
+field shows the effective values.
+
+```bash
+CC_UPSTREAM_RETRY_MAX=0 npm start        # disable retries (behaviour reverts to before this change)
+CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # wider backoff (default 400ms)
+```
+
+> **Scope**: the retry loop covers both the streaming and non-streaming paths of `/v1/chat/completions`.
+> `/v1/messages` and `/v1/responses` have a different structure and are not covered by this change (drops are still
+> reported as before).
 
 ## Memory & Deployment
 

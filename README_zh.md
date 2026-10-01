@@ -88,6 +88,8 @@ commandcode/
 | `CC_MAX_TOOL_IMAGE_MB` | `6` | 单请求内工具截图（base64）总预算，超预算的老图换成占位；`0` 关闭，见[工具截图预算](#工具截图预算) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（同上）|
+| `CC_UPSTREAM_RETRY_MAX` | `2` | 上游「未吐字前闪断」的内部重试次数；`0` = 关闭，见[上游闪断重试](#上游闪断重试) |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | 重试退避基数（毫秒），实际退避 = base × 尝试序号 |
 | `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限 `503`，见[在途上限](#在途请求上限可选) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数就断开该客户端，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | 后端 keep-alive 时长（`headersTimeout` 自动 +1s）。**必须大于反代侧的 keepalive_timeout**，见 [keep-alive 时序](#nginx-反代建议) |
@@ -609,6 +611,45 @@ CC_STREAM_IDLE_MS=300000 npm start      # 5 分钟
 
 > ⚠️ 误杀的成本不止一次失败：被 abort 后返回 `429 + retry_after`，SDK 会自动重试，
 > 而重试等于**完整重发整个上下文**，长会话下每次误杀都要重付一次全量 prefill。
+
+## 上游闪断重试
+
+CC 上游在高峰期会中途掐断连接（对端 RST/FIN），undici 抛 `TypeError: terminated`；改动前这类闪断会原样回给下游
+`502 {"error":{"message":"Upstream error: terminated","type":"proxy_error"}}`。
+
+只要**此刻尚未向下游写出任何字节**，这个请求对下游而言从未开始过 —— 代理内部重试即可消化掉抖动，
+下游（CPA / 客户端）不必先吃一个 502 再自己重试（那等于完整重发整个上下文）。
+
+- **重试条件（需同时满足）**：① 上游没走完 —— 传输层闪断（`terminated` / `ECONNRESET` / `ECONNREFUSED` /
+  `EPIPE` / `ETIMEDOUT` / `UND_ERR_SOCKET` / `socket hang up` / `other side closed` / `fetch failed`），
+  或对端**干净收尾但整条流里没有 finish 事件**（FIN 截断，与 RST 同类）；
+  ② 尚未向下游写出任何字节（流式看是否已写出 header / 事件，非流式看 `headersSent`）；
+  ③ 客户端没断连；④ 未达重试上限。
+- 一旦已经向下游写过头或事件，**绝不重试**：语义已提交，重试只会让下游看到重复文本。
+- `STREAM_IDLE_TIMEOUT`（`429`「请减少上下文」）是刻意传给下游的信号，**不重试**。
+- 已解析到上游 `error` 事件（`429` / `503` 等）时**不重试**：连接随后再断，也优先把这条语义错误透出，
+  而不是用传输层错误覆盖成 `502`（把「上游容量不足」说成「代理挂了」是误导）。
+- 退避期间客户端断连 → 放弃重试（下游已经走了，再打一次上游只是白烧额度）。
+- 重试对下游完全透明：下游只看到一次 200（内容来自重试成功的那一次）。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `CC_UPSTREAM_RETRY_MAX` | `2` | 最大重试次数（共 3 次尝试）；`0` = 关闭本行为 |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | 退避基数（毫秒），实际退避 = base × 尝试序号 |
+
+日志里可复盘：`Upstream stream terminated before first byte - retrying` / `Upstream error before first byte - retrying` /
+`Upstream stream ended incomplete before first byte - retrying`（发生了一次重试，`attempt` / `maxAttempts` / `cause`
+或 `reason` 都在结构体里）、`Upstream retry recovered`（重试后**确实**交付了正常响应）、
+`Upstream retry abandoned (client disconnected during backoff)`（退避期间客户端走了，放弃重试）；
+启动横幅的 `upstreamRetry` 字段可直接确认生效值。
+
+```bash
+CC_UPSTREAM_RETRY_MAX=0 npm start        # 关闭重试，行为退回改动前
+CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # 退避拉长（默认 400ms）
+```
+
+> **覆盖范围**：目前 `/v1/chat/completions` 的流式与非流式两条路径都接了重试循环；
+> `/v1/messages` 与 `/v1/responses` 结构不同，未在本次改动中覆盖（闪断仍按原样报错）。
 
 ## 内存与部署
 

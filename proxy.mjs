@@ -245,6 +245,35 @@ const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
   return Number.isFinite(ms) && ms > 0 ? ms : 90000;   // 默认 90s — 非流式超时更宽容
 })();
 
+// ── 上游闪断透明重试（未吐字前 bounded retry）─────────
+// CC 上游在高峰期会中途掐断流，undici 抛 `TypeError: terminated`
+// （cause 多为 SocketError: other side closed）。若此刻尚未向下游写出任何字节，
+// 这个请求对下游而言从未开始过 —— 代理内部重试即可消化抖动，下游（CPA / 客户端）
+// 不必看到 502 再自行退避。
+// 只在「未吐字」时重试：一旦写过头或输出过事件，语义就已提交，重试会造成重复文本。
+// 默认 2 = 最多重试 2 次（共 3 次尝试）；CC_UPSTREAM_RETRY_MAX=0 可整体关闭。
+const UPSTREAM_RETRY_MAX = (() => {
+  const n = Number.parseInt(process.env.CC_UPSTREAM_RETRY_MAX ?? '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 2;
+})();
+const UPSTREAM_RETRY_BASE_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_UPSTREAM_RETRY_BASE_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 400;   // 退避 = base × 尝试序号
+})();
+
+// 区分「传输层闪断」（可安全重试）与「语义错误」（不可重试）。
+// STREAM_IDLE_TIMEOUT 是刻意发给下游的「请减少上下文」信号，绝不重试。
+function isRetryableUpstreamError(e) {
+  if (!e) return false;
+  const blob = [e.message, e.code, e.cause?.message, e.cause?.code].filter(Boolean).join(' | ');
+  if (/STREAM_IDLE_TIMEOUT/.test(blob)) return false;
+  return /terminated|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|UND_ERR_SOCKET|socket hang up|other side closed|fetch failed/i.test(blob);
+}
+
+// 仅用于日志：rewinds = 实际重试次数，recovered = 重试后成功交付的次数
+const upstreamRetryStats = { rewinds: 0, recovered: 0 };
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // 客户端「僵死」保护：既不读也不断开时，该请求会连带上游连接一直挂着（背压修复后的残留）。
 // 实测残留在途成本约 5MB/连接 —— 有界、不泄漏、断开即回收，但连接数本身无上限。
 // 默认 0 = 禁用，保持既有行为不变：僵死客户端与「卡在工具执行的合法客户端」在协议层无法
@@ -1342,13 +1371,49 @@ async function handleChatCompletions(req, res) {
   const ccBody = buildCcRequest(openaiReq);
 
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
-  const abortController = new AbortController();
+  // 每次尝试都换一个新的（已 abort 的 signal 不可复用）
+  let abortController = new AbortController();
   let aborted = false;
   // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
   const startTime = Date.now();
   let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0; let fullText = '';
   let reader = null;
   let translator = null;
+  let attempt = 0;
+  let upstreamError = null;   // 非流式路径解析出的上游语义错误（error 事件）
+  let delivered = false;      // 本次尝试是否真的把正常响应交付给了下游（用于重试后的日志/计数）
+
+  // 发起下一次尝试前，把本次尝试的上游连接收干净并记账。
+  // 只在「下游尚未收到任何字节」时调用 —— 下游没有开始过，重试才是无损的。
+  const rewindAttempt = async (message, fields) => {
+    try { reader?.cancel().catch(() => {}); } catch {}
+    try { abortController.abort(); } catch {}
+    upstreamRetryStats.rewinds++;
+    log('warn', message, {
+      path: '/v1/chat/completions',
+      model,
+      attempt,
+      maxAttempts: UPSTREAM_RETRY_MAX + 1,
+      elapsedMs: Date.now() - startTime,
+      ...fields,
+    });
+    await sleep(UPSTREAM_RETRY_BASE_MS * attempt);
+  };
+
+  // 上游闪断重试循环：只在「传输层闪断」且「尚未向下游写出任何字节」时
+  // 才再来一遍；正常路径第一轮即 break。循环体沿用原有缩进、未做重排，只为把 diff 控到最小。
+  attemptLoop: for (attempt = 1; attempt <= UPSTREAM_RETRY_MAX + 1; attempt++) {
+  // 退避期间客户端断开了：下游已经走了，再打一次上游只是白烧额度
+  if (attempt > 1 && aborted) {
+    log('info', 'Upstream retry abandoned (client disconnected during backoff)', {
+      path: '/v1/chat/completions', model, attempt, elapsedMs: Date.now() - startTime,
+    });
+    return;
+  }
+  // 每次尝试开始：重置本次请求的状态（上一次可能已被中断 / 半途失败）
+  abortController = new AbortController();
+  bytesReceived = 0; lastCcEvent = ''; keepaliveCount = 0; fullText = '';
+  reader = null; translator = null; upstreamError = null; delivered = false;
 
   try {
     // 首次初始化（fingerprint + lifecycle）
@@ -1364,8 +1429,8 @@ async function handleChatCompletions(req, res) {
       return;
     }
 
-    // 下游断连检测：打断 CC 上游 + 记录日志
-    res.on('close', () => {
+    // 下游断连检测：打断 CC 上游 + 记录日志（只在首次尝试注册，重试不重复挂载监听器）
+    if (attempt === 1) res.on('close', () => {
       if (res.writableEnded) return; // Normal completion, not a disconnect
       aborted = true;
       const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
@@ -1478,6 +1543,12 @@ async function handleChatCompletions(req, res) {
           // 零输出只是它的表象（此时按 429 报会掩盖真实原因）。
           } else if (translator.incompleteDetail()) {
             const detail = translator.incompleteDetail();
+            // 对端 FIN（干净收尾、没有 finish 事件）与 RST 是同一类闪断：既然还没向下游吐过
+            // 字节，就先内部重试，而不是直接把 502 交给下游去自行重发整个上下文。
+            if (!started && !aborted && attempt <= UPSTREAM_RETRY_MAX) {
+              await rewindAttempt('Upstream stream ended incomplete before first byte - retrying', { reason: detail });
+              continue attemptLoop;
+            }
             log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: detail });
             const err = incompleteUpstreamError(detail);
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -1502,12 +1573,14 @@ async function handleChatCompletions(req, res) {
               started = true;
             }
             res.write(translator.getDoneEvent());
+            delivered = true;
           }
         }
       } catch (e) {
         if (aborted) {
           // 客户端已断连，只清理（close handler 已调用 abortController.abort()）
-          try { reader.cancel(); } catch {}
+          // cancel() 返回 promise：不接住的话，连接已被对端掐断时会抛 UnhandledPromiseRejection
+          try { reader.cancel().catch(() => {}); } catch {}
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
             path: '/v1/chat/completions',
@@ -1522,7 +1595,7 @@ async function handleChatCompletions(req, res) {
             outputTokens: translator.outputTokens,
             cachedInputTokens: translator.cachedInputTokens,
           });
-          try { reader.cancel(); } catch {}
+          try { reader.cancel().catch(() => {}); } catch {}
           try { abortController.abort(); } catch {} // 打断 CC 上游，避免浪费 token
           consecutiveTimeouts++;
           const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
@@ -1540,7 +1613,23 @@ async function handleChatCompletions(req, res) {
             // 下游若已僵死（不读也不断），由 CLIENT_DRAIN_TIMEOUT_MS 那条路径负责兜底。
             try { res.end(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
           }
+        // 已经解析出上游语义错误（429/503 等）时不重试：那是有意传下来的信号，重试会把它吞掉
+        } else if (!started && !aborted && !translator?.upstreamError
+                   && attempt <= UPSTREAM_RETRY_MAX && isRetryableUpstreamError(e)) {
+          // 传输层闪断且尚未向下游写过任何字节 → 代理内部静默重试（下游全程无感）
+          await rewindAttempt('Upstream stream terminated before first byte - retrying', {
+            message: e.message,
+            cause: e.cause?.code || e.cause?.message || '(none)',
+          });
+          continue attemptLoop;
         } else {
+          // 传输层错误不要覆盖已经解析到的语义错误：把「上游容量不足」说成「代理挂了」是误导
+          if (translator?.upstreamError && !started) {
+            log('warn', 'Upstream terminated after a parsed semantic error', { message: e.message });
+            try { abortController.abort(); } catch {}
+            sendJSON(res, translator.upstreamError.status, translator.upstreamError.body);
+            return;
+          }
           log('error', 'Stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
           if (!started) {
@@ -1563,7 +1652,6 @@ async function handleChatCompletions(req, res) {
       let sawFinish = false;
       let usage = null;
       let toolCalls = null;
-      let upstreamError = null;
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1629,17 +1717,22 @@ async function handleChatCompletions(req, res) {
       };
 
       const idle = createIdleWatchdog(NONSTREAM_IDLE_TIMEOUT_MS);
-      while (true) {
-        const result = await Promise.race([reader.read(), idle.arm()]);
-        const { done, value } = result;
-        if (done) break;
-        bytesReceived += value.length;
-        const chunkText = decoder.decode(value, { stream: true });
-        buf += chunkText;
-        // 无换行则不可能产生完整行，跳过全量 split（见 handleChatCompletions 流式段同处说明）
-        if (chunkText.indexOf('\n') !== -1) processLines();
+      // 读循环抛错（闪断）时也必须释放看门狗：否则每次失败尝试都会留下一个 armed 的定时器，
+      // 重试期间累积（流式路径的 finally 已覆盖同一件事）
+      try {
+        while (true) {
+          const result = await Promise.race([reader.read(), idle.arm()]);
+          const { done, value } = result;
+          if (done) break;
+          bytesReceived += value.length;
+          const chunkText = decoder.decode(value, { stream: true });
+          buf += chunkText;
+          // 无换行则不可能产生完整行，跳过全量 split（见 handleChatCompletions 流式段同处说明）
+          if (chunkText.indexOf('\n') !== -1) processLines();
+        }
+      } finally {
+        idle.dispose();
       }
-      idle.dispose();
       processLines();
 
       if (upstreamError) {
@@ -1650,6 +1743,11 @@ async function handleChatCompletions(req, res) {
       // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
       const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
       if (incomplete) {
+        // 尚未向下游写过任何字节（非流式此时 headers 还没发）→ 与传输层闪断同等对待，先重试
+        if (!aborted && !upstreamError && attempt <= UPSTREAM_RETRY_MAX) {
+          await rewindAttempt('Upstream stream ended incomplete before first byte - retrying', { reason: incomplete });
+          continue attemptLoop;
+        }
         log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: incomplete });
         const err = incompleteUpstreamError(incomplete);
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -1690,7 +1788,17 @@ async function handleChatCompletions(req, res) {
       };
     })(),
       });
+      delivered = true;
     }
+    // 只有本次尝试真的交付了正常响应才算「重试救回来了」；
+    // 已向下游报错的尝试（502/429）不能记成 recovered
+    if (attempt > 1 && delivered) {
+      upstreamRetryStats.recovered++;
+      log('info', 'Upstream retry recovered', {
+        path: '/v1/chat/completions', model, attempt, elapsedMs: Date.now() - startTime,
+      });
+    }
+    break attemptLoop;   // 本次尝试已完整处理（成功或已按语义返回错误）
   } catch (e) {
     if (abortController.signal.aborted) {
       log('warn', 'Request cancelled (client disconnected before CC response)', {
@@ -1698,6 +1806,7 @@ async function handleChatCompletions(req, res) {
         model,
         completionId,
       });
+      return; // 下游已断连：不再重试（res 已关闭）
     } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', {
         path: '/v1/chat/completions',
@@ -1710,7 +1819,7 @@ async function handleChatCompletions(req, res) {
         lastCcEvent: lastCcEvent || '(none)',
         partialLen: fullText ? fullText.length : 0,
       });
-      try { reader?.cancel(); } catch {}
+      try { reader?.cancel().catch(() => {}); } catch {}
       try { abortController.abort(); } catch {} // 打断 CC 上游
       consecutiveTimeouts++;
       const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
@@ -1718,12 +1827,32 @@ async function handleChatCompletions(req, res) {
         : 'Response timeout - request timed out';
       res.setHeader('Retry-After', '5');
       sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
+      return; // 超时已按语义回给下游（由下游决定是否重试），本代理不重试
+    // 已解析出上游语义错误（429/503 等）时不重试：那是有意传下来的信号，重试会把它吞掉
+    } else if (!res.headersSent && !aborted && !upstreamError && !translator?.upstreamError
+               && attempt <= UPSTREAM_RETRY_MAX && isRetryableUpstreamError(e)) {
+      // 传输层闪断且尚未向下游写出任何字节 → 代理内部静默重试（下游全程无感）
+      await rewindAttempt('Upstream error before first byte - retrying', {
+        message: e.message,
+        cause: e.cause?.code || e.cause?.message || '(none)',
+      });
+      continue attemptLoop;
     } else {
+      // 传输层错误不要覆盖已经解析到的语义错误：把「上游容量不足」说成「代理挂了」是误导
+      const semantic = upstreamError || translator?.upstreamError;
+      if (semantic && !res.headersSent) {
+        log('warn', 'Upstream terminated after a parsed semantic error', { message: e.message });
+        try { abortController.abort(); } catch {}
+        sendJSON(res, semantic.status, semantic.body);
+        return;
+      }
       log('error', 'Upstream error', { message: e.message });
       try { abortController.abort(); } catch {} // 打断 CC 上游
       sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+      return;
     }
   }
+  }   // ← end of attemptLoop
 }
 
 // ── Anthropic /v1/messages 协议转换 ─────────────────
@@ -2208,7 +2337,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   } finally {
     // 确保流中断时通知上游
     idle.dispose();
-    try { reader.cancel(); } catch {}
+    try { reader.cancel().catch(() => {}); } catch {}
   }
 }
 
@@ -2558,7 +2687,7 @@ async function handleMessages(req, res) {
         lastCcEvent: lastCcEvent || '(none)',
         partialLen: fullText ? fullText.length : 0,
       });
-      try { reader?.cancel(); } catch {}
+      try { reader?.cancel().catch(() => {}); } catch {}
       try { abortController.abort(); } catch {} // 打断 CC 上游
       consecutiveTimeouts++;
       const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
@@ -3331,7 +3460,7 @@ async function handleResponses(req, res) {
         }
       } catch (e) {
         if (aborted) {
-          try { reader.cancel(); } catch (e2) {}
+          try { reader.cancel().catch(() => {}); } catch (e2) {}
         } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
           log('warn', 'Stream idle timeout', {
             path: '/v1/responses', model, streaming: true, timeoutMs: STREAM_IDLE_TIMEOUT_MS,
@@ -3577,6 +3706,9 @@ process.on('unhandledRejection', (reason) => {
   if (reason?.name === 'AbortError' || reason?.code === 'ABORT_ERR') {
     // 客户端断连触发的 abort — 预期行为，静默处理
     log('info', 'Aborted request cleaned up');
+  } else if (isRetryableUpstreamError(reason)) {
+    // 上游传输层闪断造成的异步 rejection（如 socket terminated），已被重试机制或上层吸收
+    log('info', 'Upstream socket terminated asynchronously (handled)');
   } else {
     log('error', 'Unhandled rejection', { message: reason?.message || String(reason), stack: reason?.stack?.split('\n')[0] });
   }
@@ -3615,6 +3747,9 @@ server.listen(CFG.port, CFG.host, () => {
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
     upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
+    upstreamRetry: UPSTREAM_RETRY_MAX > 0
+      ? `${UPSTREAM_RETRY_MAX} retries, base ${UPSTREAM_RETRY_BASE_MS}ms (only before first byte)`
+      : 'disabled (CC_UPSTREAM_RETRY_MAX=0)',
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
