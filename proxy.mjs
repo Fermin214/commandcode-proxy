@@ -2630,6 +2630,101 @@ function responsesTextOf(content) {
   return content.map(p => (p && typeof p === 'object' ? (p.text || '') : '')).join('');
 }
 
+// data URL 图片：一段文本里超过这个长度的 data URL 就当成"图"，提出来单独发；小图留在文本里
+const INLINE_IMAGE_MIN = 256 * 1024;
+// 单张 data URL 上限：再大就不要了，只留一句占位说明（既撑爆上游窗口，也撑爆内存）
+const MAX_TOOL_IMAGE_URL = 12 * 1024 * 1024;
+const DATA_URL_RE = /data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi;
+
+// 从一段文本里捞出体积可观的 data URL 图片，原地替换成 [image] 占位。
+// 必要性：base64 一旦被上游按**文本**分词就极其昂贵 —— 真机实测单张 2.76MB 截图 ≈ 1.92M token。
+function extractInlineImages(text) {
+  const images = [];
+  const stripped = String(text).replace(DATA_URL_RE, (url) => {
+    if (url.length < INLINE_IMAGE_MIN) return url;          // 小图留文本，别把工具输出切碎
+    if (url.length > MAX_TOOL_IMAGE_URL) return '[image omitted: too large]';
+    images.push(url);
+    return '[image]';
+  });
+  return { text: stripped, images };
+}
+
+// Responses 的 function_call_output.output 可能是字符串，也可能是内容块数组；后者能带图。
+// Codex Desktop 的截图工具就是 [{type:'input_image', image_url:'data:image/png;base64,...'}]。
+// 返回 { text, images }，images 为 data URL 字符串数组。
+function splitToolOutput(output) {
+  if (output === undefined || output === null) return { text: '', images: [] };
+  const texts = [];
+  const images = [];
+  const pushText = (raw) => {
+    const r = extractInlineImages(raw);
+    if (r.text) texts.push(r.text);
+    images.push(...r.images);
+  };
+  if (typeof output === 'string') {
+    pushText(output);
+  } else if (Array.isArray(output)) {
+    for (const part of output) {
+      if (!part) continue;
+      if (part.type === 'input_image' || part.type === 'image_url') {
+        const url = typeof part.image_url === 'string' ? part.image_url : (part.image_url && part.image_url.url) || '';
+        if (url.startsWith('data:')) {
+          if (url.length <= MAX_TOOL_IMAGE_URL) images.push(url);
+          else texts.push('[image omitted: too large]');
+        } else if (url) {
+          texts.push(`[image: ${url}]`);      // 外链图上游不认，只能留个说明
+        }
+      } else if (typeof part.text === 'string') {
+        pushText(part.text);
+      } else {
+        pushText(JSON.stringify(part));       // 未知块保持原样，与旧行为一致
+      }
+    }
+  } else {
+    pushText(JSON.stringify(output));
+  }
+  return { text: texts.filter(Boolean).join('\n'), images };
+}
+// 单条请求内"工具截图"的总字节预算。工具截图会随每一轮请求全量重传，是内存与首字延迟的
+// 头号杀手：真机实测一个 Codex 会话里 11 张截图 ≈5.5MB base64，配合 README 记录的内存放大
+// ×5.1~7.4，把 1GB 的机器打到 global OOM（node anon-rss 532MB，内核把整机拖死）。
+// 策略：从**最新**往回保留，预算内照发，超预算的老图替换成占位说明 —— 让模型知道有图被丢，
+// 而不是以为历史里本来就没图。CC_MAX_TOOL_IMAGE_MB=0 关闭该行为。
+const MAX_TOOL_IMAGE_BYTES = (() => {
+  const mb = Number.parseFloat(process.env.CC_MAX_TOOL_IMAGE_MB ?? '6');
+  return Number.isFinite(mb) && mb > 0 ? Math.round(mb * 1024 * 1024) : 0;
+})();
+
+function trimToolImages(messages) {
+  if (!MAX_TOOL_IMAGE_BYTES) return;
+  const refs = [];
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const part of m.content) if (part && part._toolImage) refs.push({ m, part });
+  }
+  if (!refs.length) return;
+  const keep = new Set();
+  let used = 0;
+  for (let i = refs.length - 1; i >= 0; i--) {           // 从最新往回挑，至少保一张
+    const len = (refs[i].part.image_url && refs[i].part.image_url.url || '').length;
+    if (keep.size === 0 || used + len <= MAX_TOOL_IMAGE_BYTES) { keep.add(i); used += len; }
+  }
+  if (keep.size === refs.length) return;                 // 没超预算，原样不动
+  let droppedBytes = 0;
+  for (let i = 0; i < refs.length; i++) {
+    if (keep.has(i)) continue;
+    const idx = refs[i].m.content.indexOf(refs[i].part);
+    if (idx === -1) continue;
+    droppedBytes += (refs[i].part.image_url && refs[i].part.image_url.url || '').length;
+    refs[i].m.content[idx] = { type: 'text', text: '[older tool screenshot omitted: image budget exceeded]' };
+  }
+  log('warn', 'Tool images trimmed to budget', {
+    total: refs.length, kept: keep.size, dropped: refs.length - keep.size,
+    keptBytes: used, droppedBytes, budgetBytes: MAX_TOOL_IMAGE_BYTES,
+  });
+}
+
+
 function responsesReasoningOf(item) {
   if (!item) return '';
   if (Array.isArray(item.summary) && item.summary.length) return item.summary.map(p => (p && p.text) || '').join('');
@@ -2703,11 +2798,26 @@ function convertResponsesToChat(respReq) {
         }
         case 'function_call_output': {
           flushPending();
-          messages.push({
-            role: 'tool',
-            tool_call_id: item.call_id || '',
-            content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output === undefined ? '' : item.output),
-          });
+          // 工具结果里可能带图（Codex Desktop 截图工具即 output=[{type:'input_image', image_url:'data:image/png;base64,...'}]）。
+          // 绝不能 JSON.stringify 成文本送上游：base64 会按文本分词，真机实测单张 2.76MB 截图 ≈ 1.92M token，
+          // 直接撞穿模型 1M 窗口（"maximum context length is 1048576 tokens ... 1922800 in the messages"）。
+          // 官方 CLI 的排布是：tool-result 只放文本，图片提出来放进紧跟其后的一条 user 消息
+          // （见 command-code@1.66.0 dist/cli.mjs 的 convertUserMessage / tool_result 分支）。
+          const { text, images } = splitToolOutput(item.output);
+          messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: text });
+          if (images.length) {
+            log('info', 'Hoisted tool-output images to user message', {
+              count: images.length, bytes: images.reduce((a, u) => a + u.length, 0),
+            });
+            // content 走 image_url 形态，交给 buildCcRequest 里已验证的 user 图片分支转成 CC 的 {type:'image',image,mimeType}
+            messages.push({
+              role: 'user',
+              content: [
+                { type: 'text', text: '[image returned by tool call]' },
+                ...images.map(url => ({ type: 'image_url', image_url: { url }, _toolImage: true })),
+              ],
+            });
+          }
           break;
         }
         default: {
@@ -2718,6 +2828,9 @@ function convertResponsesToChat(respReq) {
     }
   }
   flushPending();
+
+  // 统一裁剪工具截图（此时所有 item 都已转成 chat 形态，按顺序处理最直观）
+  trimToolImages(messages);
 
   let tools;
   if (Array.isArray(respReq.tools) && respReq.tools.length) {
@@ -2918,6 +3031,9 @@ function createResponsesSseTranslator(model, responseId, created) {
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
+    // 提前发 created/in_progress（不带内容）：上游是 reasoning 模型，大 prompt 首字可能要十几秒，
+    // 这期间一个字节都不出网就会被中间层（实测 EdgeOne 源站 ~15s）或客户端首字节超时掐掉
+    start: startResponse,
     get started() { return createdSent; },
     get stopReason() { return finishReason; },
     parseLine(line) {
@@ -2991,6 +3107,16 @@ function createResponsesSseTranslator(model, responseId, created) {
 
         case 'error': {
           this.upstreamError = mapCcEventError(event);
+          // 上游在 HTTP 200 之后于**流内**报错时，这里以前只赋值不打日志：客户端收到 400，
+          // 而 journalctl 里一片安静（本次排障就是靠 nginx 的 body_bytes_sent=0 反推的）。
+          // 对齐 /v1/chat/completions 路径的 CC stream error。
+          log('warn', 'CC stream error', {
+            path: '/v1/responses',
+            message: event.error?.message || event.message || 'Unknown error',
+            upstreamStatus: this.upstreamError.reportedStatus,
+            code: this.upstreamError.code,
+            mappedTo: this.upstreamError.status,
+          });
           break;
         }
 
@@ -3136,6 +3262,24 @@ async function handleResponses(req, res) {
         await waitDrain(res);
       };
 
+      // 上游已 200：立刻把响应头 + response.created / response.in_progress 推下去。
+      // 不能等首个内容事件 —— Codex 实测 reasoning_effort=max + 大 prompt，首字要 15s+，
+      // 这段时间此前**零字节出网**，于是 nginx access.log 全是 `499 0`（body_bytes_sent=0）、
+      // 中间 CDN（EdgeOne）按源站超时掐掉连接、客户端只能每 15 秒重试一次。
+      // created 是不带内容的协议首事件，先发符合 Responses 语义；上游随后失败会走 response.failed。
+      await writeEvents(translator.start());
+
+      // SSE 保活：对齐 /v1/messages 的心跳思路，但这里发**注释行**。
+      // Responses 协议没有 ping 事件，塞未知 event 类型有被严格解析器判错的风险；
+      // 注释行（以 ':' 开头）按 SSE 规范必须被忽略 —— chat 端点在静默事件时也是这么发的。
+      // 为什么必须发：首字前的静默期实测 15~40s，中间层的"源站空闲"超时（EdgeOne 实测约 15s）
+      // 会把连接掐掉 —— 现象是客户端 ~16s 断连、代理侧 Client disconnected、nginx 只记到很少字节。
+      const heartbeat = setInterval(() => {
+        // 回调是同步的，无法 await waitDrain，所以用 writableNeedDrain 直接跳过（背压时少一条注释无副作用）
+        if (aborted || !started || res.writableEnded || res.writableNeedDrain) return;
+        try { res.write(': keepalive\n\n'); } catch (e2) {}
+      }, 5000);
+
       try {
         while (true) {
           const result = await Promise.race([reader.read(), idle.arm()]);
@@ -3214,6 +3358,7 @@ async function handleResponses(req, res) {
           }
         }
       } finally {
+        clearInterval(heartbeat);
         idle.dispose();
       }
 
