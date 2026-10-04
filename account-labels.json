@@ -1,0 +1,5 @@
+[
+  {"index": 0, "label": "QQ小号", "proxy": "proxy-a", "port": 3051},
+  {"index": 1, "label": "谷歌大号", "proxy": "proxy-b", "port": 3052},
+  {"index": 2, "label": "QQ大号", "proxy": "proxy-c", "port": 3053}
+]

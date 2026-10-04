@@ -8,3 +8,12 @@ stdout.txt
 stderr.txt
 captured-requests/
 
+
+# Runtime credentials and account state
+config.json
+user-keys.txt
+router-client-key
+account-last-call.json
+account-stats.json
+account-history/
+*.before-*

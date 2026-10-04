@@ -1,15 +1,76 @@
-version: "3.9"
-
 services:
-  proxy:
-    build: .
+  proxy-a:
+    image: commandcode-proxy:trial
+    container_name: commandcode-proxy-a
     ports:
-      - "${PROXY_PORT:-3050}:3050"
+      - "127.0.0.1:3051:3050"
     environment:
       PORT: "3050"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "http://127.0.0.1:3050/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  proxy-b:
+    image: commandcode-proxy:trial
+    container_name: commandcode-proxy-b
+    ports:
+      - "127.0.0.1:3052:3050"
+    environment:
+      PORT: "3050"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://127.0.0.1:3050/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  proxy-c:
+    image: commandcode-proxy:trial
+    container_name: commandcode-proxy-c
+    ports:
+      - "127.0.0.1:3053:3050"
+    environment:
+      PORT: "3050"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://127.0.0.1:3050/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  router:
+    image: node:22-alpine
+    container_name: commandcode-router
+    network_mode: host
+    command: ["node", "/app/router.mjs"]
+    environment:
+      PORT: "3060"
+      ROUTER_KEYS_FILE: /data/user-keys.txt
+      ROUTER_CLIENT_KEY_FILE: /data/router-client-key
+      ROUTER_LABELS_FILE: /data/account-labels.json
+      ROUTER_STATE_FILE: /data/account-last-call.json
+      ROUTER_HISTORY_FILE: /data/account-history/account-history.jsonl
+      ROUTER_HISTORY_DIR: /data/account-history
+      ROUTER_HISTORY_RETENTION_DAYS: "90"
+      ROUTER_STATS_FILE: /data/account-stats.json
+      ROUTER_PORTS: 3051,3052,3053
+    volumes:
+      - ./router.mjs:/app/router.mjs:ro
+      - ./user-keys.txt:/data/user-keys.txt:ro
+      - ./router-client-key:/data/router-client-key:ro
+      - ./account-labels.json:/data/account-labels.json:ro
+      - ./account-last-call.json:/data/account-last-call.json
+      - ./account-history:/data/account-history
+      - ./account-stats.json:/data/account-stats.json
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://127.0.0.1:3060/health"]
       interval: 30s
       timeout: 3s
       retries: 3
