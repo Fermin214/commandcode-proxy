@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 const { randomUUID } = crypto;
 import fs from 'node:fs';
 import path from 'node:path';
+import { createUsageObserver, emptyUsageCounters, addUsage, combineUsage, publicUsage, usageDay } from './router-usage.mjs';
 
 const keys = fs.readFileSync(process.env.ROUTER_KEYS_FILE || '/data/user-keys.txt', 'utf8')
   .split(/\r?\n/).map(s => s.trim()).filter(Boolean);
@@ -70,6 +71,17 @@ function recordAccountCall(index, fields) {
   if (fields.status !== null && fields.status >= 400) dayStats.http_errors += 1;
   dayStats.last_started_at = fields.started_at; dayStats.last_finished_at = fields.finished_at;
   stats.days[day] = dayStats; accountStats[key] = stats;
+  if (fields.usage_status) {
+    stats.usage_tracking_started_at ||= fields.started_at;
+    stats.usage_days ||= {};
+    const usageDate = usageDay(new Date(fields.started_at));
+    const models = Object.assign(Object.create(null), stats.usage_days[usageDate] || {});
+    const model = typeof fields.model === 'string' && fields.model.length <= 256 ? fields.model : '(unknown)';
+    const counters = models[model] || emptyUsageCounters();
+    addUsage(counters, fields);
+    models[model] = counters;
+    stats.usage_days[usageDate] = models;
+  }
   try {
     rotateAccountHistory(day);
     fs.appendFileSync(accountHistoryFile, JSON.stringify(event) + '\n');
@@ -190,14 +202,17 @@ function sendRouterError(res, result) {
   res.writeHead(status, headers);
   res.end(JSON.stringify({ error: { type: 'upstream_error', message: result.error || 'upstream request failed' } }));
 }
-function forward(req, res, index, body, requestId, state, nonStream) {
+function forward(req, res, index, body, requestId, state, nonStream, trackUsage) {
   return new Promise((resolve) => {
+    const usageObserver = trackUsage ? createUsageObserver(new URL(req.url, 'http://localhost').pathname) : null;
+    let responseStreaming = false;
     let settled = false;
     const finish = result => {
       if (settled) return;
       settled = true;
       state.upstream = null;
-      resolve(result);
+      resolve({ ...result, ...(usageObserver ? usageObserver.result({ complete: result.complete === true,
+        streaming: responseStreaming, status: result.status }) : {}) });
     };
     const target = new URL(req.url, hosts[index % hosts.length]);
     const headers = { ...req.headers, host: `127.0.0.1:${ports[index % ports.length]}`, authorization: `Bearer ${keys[index % keys.length]}` };
@@ -215,12 +230,13 @@ function forward(req, res, index, body, requestId, state, nonStream) {
       const status = upstreamRes.statusCode || 502;
       markAccountUnavailable(index, status, requestId);
       // Observe a bounded copy for correlation; the response itself remains a byte-for-byte pipe.
-      let chunks = (nonStream || status === 429) && /^application\/json\b/i.test(upstreamRes.headers['content-type'] || '')
+      let chunks = (nonStream || trackUsage || status === 429) && /^application\/json\b/i.test(upstreamRes.headers['content-type'] || '')
         && (!upstreamRes.headers['content-encoding'] || upstreamRes.headers['content-encoding'] === 'identity') ? [] : null;
       let capturedBytes = 0;
       // Inspect bounded SSE frames without buffering/delaying the forwarded stream.
       const isSse = /^text\/event-stream\b/i.test(upstreamRes.headers['content-type'] || '')
         && !upstreamRes.headers['content-encoding'];
+      responseStreaming = isSse;
       const decoder = new TextDecoder();
       let sseBuffer = '';
       let dropFrame = false;
@@ -235,7 +251,9 @@ function forward(req, res, index, body, requestId, state, nonStream) {
               const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:'))
                 .map(line => line.slice(5).trimStart()).join('\n');
               try {
+                if (data.trim() === '[DONE]') { usageObserver?.sse('[DONE]'); continue; }
                 const parsed = JSON.parse(data);
+                usageObserver?.sse(parsed);
                 observedQuota = observeQuota(index, parsed.error || parsed.response?.error, requestId) || observedQuota;
               } catch {}
             }
@@ -250,10 +268,13 @@ function forward(req, res, index, body, requestId, state, nonStream) {
       });
       upstreamRes.on('end', () => {
         const captured = chunks ? Buffer.concat(chunks) : null;
+        if (captured) {
+          try { usageObserver?.json(JSON.parse(captured.toString('utf8'))); } catch {}
+        }
         if (status === 429 && captured) {
           try { observedQuota = observeQuota(index, JSON.parse(captured.toString('utf8')).error, requestId); } catch {}
         }
-        finish({ status, responseId: nonStream && captured ? responseIdFrom(captured) : null,
+        finish({ status, complete: true, responseId: nonStream && captured ? responseIdFrom(captured) : null,
           quota: observedQuota ? { code: observedQuota.code, rateLimit: observedQuota.rateLimit } : null });
       });
       upstreamRes.on('error', error => finish({ status, error: error.message }));
@@ -278,6 +299,43 @@ const server = http.createServer(async (req, res) => {
   if (!authorized(req)) { res.writeHead(401, {'content-type':'application/json'}); res.end(JSON.stringify({error:{type:'auth_error',message:'invalid router key'}})); return; }
   const requestId = requestIdFrom(req);
   res.setHeader('x-request-id', requestId);
+  const requestUrl = new URL(req.url, 'http://localhost');
+  if (requestUrl.pathname === '/admin/usage' && req.method === 'GET') {
+    const from = requestUrl.searchParams.get('from') || usageDay(new Date());
+    const to = requestUrl.searchParams.get('to') || from;
+    const validDate = value => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value))
+      && new Date(value).toISOString().slice(0, 10) === value;
+    const account = requestUrl.searchParams.get('account');
+    const model = requestUrl.searchParams.get('model');
+    if (!validDate(from) || !validDate(to) || to < from || Date.parse(to) - Date.parse(from) > 30 * 86400000
+        || (account !== null && (!/^\d+$/.test(account) || Number(account) >= accountCount))
+        || (model !== null && model.length > 256)) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'use valid dates (at most 31 days), account index and model' } }));
+      return;
+    }
+    const rows = [];
+    const totals = emptyUsageCounters();
+    for (let index = 0; index < accountCount; index++) {
+      if (account !== null && Number(account) !== index) continue;
+      const stats = accountStats[String(index)];
+      for (const [day, models] of Object.entries(stats?.usage_days || {})) {
+        if (day < from || day > to) continue;
+        for (const [name, counters] of Object.entries(models)) {
+          if (model !== null && name !== model) continue;
+          combineUsage(totals, counters);
+          rows.push({ ...accountMeta(index), day, model: name, ...publicUsage(counters) });
+        }
+      }
+    }
+    rows.sort((a, b) => a.day.localeCompare(b.day) || a.index - b.index || a.model.localeCompare(b.model));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ timezone: 'Asia/Shanghai', source: 'proxy_response_usage', from, to,
+      tracking_started_at: Array.from({ length: accountCount }, (_, index) => ({ index,
+        label: accountMeta(index).label, started_at: accountStats[String(index)]?.usage_tracking_started_at || null })),
+      rows, totals: publicUsage(totals) }));
+    return;
+  }
   if (req.url === '/admin/accounts' && req.method === 'GET') {
     const accounts = Array.from({ length: accountCount }, (_, index) => {
       const quota = quotaCooldown(index);
@@ -347,12 +405,14 @@ const server = http.createServer(async (req, res) => {
   log('request', { request_id: requestId, method: req.method, path: req.url, scheduled: primary, scheduled_account: accountMeta(primary).label, actual: index, account: accountMeta(index).label, ...requestMeta });
   const startedAt = new Date();
   const startedMs = Date.now();
-  const last = await forward(req, res, index, body, requestId, state, new URL(req.url, 'http://localhost').pathname === '/v1/chat/completions' && requestMeta.stream === false);
+  const trackUsage = req.method === 'POST' && ['/v1/chat/completions', '/v1/messages', '/v1/responses'].includes(requestUrl.pathname);
+  const last = await forward(req, res, index, body, requestId, state, requestUrl.pathname === '/v1/chat/completions' && requestMeta.stream === false, trackUsage);
   if (last.error && !state.clientDisconnected) sendRouterError(res, last);
   res.off('close', onClientClose);
   req.off('aborted', onClientClose);
   const finishedAt = new Date();
-  const fields = { request_id: requestId, router_request_id: requestId, started_at: startedAt.toISOString(), finished_at: finishedAt.toISOString(), duration_ms: Date.now() - startedMs, status: last.status ?? null, retry: false, error: state.clientDisconnected ? 'client disconnected' : last.error || null, response_id: last.responseId || null, model: requestMeta.model, stream: requestMeta.stream, method: req.method, path: req.url,
+  const fields = { request_id: requestId, router_request_id: requestId, started_at: startedAt.toISOString(), finished_at: finishedAt.toISOString(), duration_ms: Date.now() - startedMs, status: last.status ?? null, retry: false, error: state.clientDisconnected ? 'client disconnected' : last.error || (last.semantic_error ? 'upstream semantic error' : last.stream_incomplete ? 'incomplete stream' : null), response_id: last.responseId || null, model: requestMeta.model, stream: requestMeta.stream, method: req.method, path: req.url,
+    ...(trackUsage ? { usage_status: last.usage_status, usage: last.usage } : {}),
     ...(last.quota ? { quota: last.quota } : {}) };
   log('attempt', { scheduled: primary, scheduled_account: accountMeta(primary).label, actual: index, account: accountMeta(index).label, proxy: accountMeta(index).proxy, ...fields });
   recordAccountCall(index, fields);

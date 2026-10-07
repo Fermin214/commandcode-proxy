@@ -59,8 +59,8 @@ a proxy. Already in-flight requests can finish after a cooldown is discovered.
 Until reset, backup accounts take more traffic and may exhaust their quotas too.
 
 This guarantees one **router-to-proxy** request per incoming request. The
-unmodified upstream `proxy.mjs` still has its own bounded same-account
-connection retry behavior. The router does not claim to eliminate those retries
+proxy retains upstream's bounded same-account connection retry behavior.
+The router does not claim to eliminate those retries
 or to know whether an interrupted CommandCode generation was billed.
 
 ## Cancellation and correlation
@@ -90,6 +90,66 @@ Existing last-call files, per-account daily statistics, daily history rotation
 and 90-day retention remain. Historical retry totals are retained; this router
 does not increment them. A disconnected or incomplete attempt is not counted as
 a successful request.
+
+## Account/model token usage
+
+The router-owned `router-usage.mjs` observes response usage for POST requests to
+Chat Completions, Anthropic Messages and Responses. It never changes the body,
+stream order, requested model, retry behavior or number of upstream calls.
+JSON observation is capped at 2 MiB; SSE observation retains at most one bounded
+64 KiB frame between chunks. Unsupported/compressed or oversized responses still
+pass through; unobserved usage remains unknown. Prompts, model text, raw responses
+and credentials are not saved in the usage records.
+
+Each generation request is counted once under the actual selected account and
+the requested model. Daily usage groups use **Asia/Shanghai**, attributed to the
+request start date, separate from the existing UTC-day account counters. Aggregates
+are stored in `account-stats.json` under `usage_days`; individual usage records
+are also included in the existing request history. Statistics survive restart.
+Existing account totals/history are retained, but old token usage is not
+reconstructed. Each account exposes its own `tracking_started_at` timestamp.
+
+Input tokens include cache read/write tokens. OpenAI Chat/Responses already report
+total input; their cache counts are subsets and are not added a second time.
+Anthropic input is uncached input plus cache read and cache creation. Missing cache
+components remain unknown; reported zero is retained as zero. Cumulative SSE usage
+is updated rather than summed, and a normal terminal event is required for a full
+stream report. Semantic errors, client disconnects and truncated streams never
+count observed token values as full successful usage.
+
+`GET /admin/usage` uses the existing router bearer authentication and does not
+contact any upstream account. It accepts:
+
+| Query | Meaning |
+| --- | --- |
+| `from`, `to` | Inclusive `YYYY-MM-DD` range, at most 31 days; default is today in Beijing time |
+| `account` | Optional account index (`0`, `1`, `2`) |
+| `model` | Optional exact requested model ID; URL-encode slashes |
+
+For example: `/admin/usage?from=2026-10-07&to=2026-10-07&account=0&model=Qwen%2FQwen3.8-Flash`.
+The response contains per-account/day/model `rows`, filtered `totals`, timezone,
+source and per-account tracking start times. Counter fields:
+
+- `calls`, `success`, `failed`: generation requests; health/models/admin queries
+  are excluded.
+- `usage_reported`: completed responses with valid input/output usage.
+- `usage_partial`: observed counters from failed/incomplete responses or
+  responses missing a required component; kept separate from full reports.
+- `usage_unknown`: no valid token counters observed; never interpreted as free.
+- `tokens`, `partial_tokens`: separate sums for input, output and cache read/write.
+  An unobserved field is `null`, not zero. `token_reports` and
+  `partial_token_reports` show the number of contributing reports per field.
+
+The source is `proxy_response_usage`: some values can already be estimates or
+defaults produced by the upstream core proxy. The router cannot determine their
+original provenance without changing that core. These response-side totals are
+not a provider bill, currency cost or remaining subscription quota. This change
+adds no further modifications to `proxy.mjs` and does not include a usage UI.
+
+Deploy the helper alongside `router.mjs` with the added read-only Compose mount;
+only the router needs recreation. Preserve the existing statistics and quota-state
+mounts. Rollback restores the preceding router and Compose configuration; the
+additional statistics/history fields can remain for later recovery.
 
 ## Compatibility boundary
 

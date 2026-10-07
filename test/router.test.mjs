@@ -474,3 +474,184 @@ test('all quota-exhausted accounts reject new requests without calling a proxy',
     assert.deepEqual(router.mocks.map(m => m.state.calls), [1, 1, 1]);
   } finally { await router.close(); }
 });
+
+async function usageReport(router, query = '') {
+  const response = await fetch(router.base + '/admin/usage' + query, { headers: AUTH });
+  assert.equal(response.status, 200);
+  return response.json();
+}
+
+test('JSON usage is grouped by account, requested model and Beijing date without changing the response', async () => {
+  const body = JSON.stringify({ id: 'chatcmpl-tokens', model: 'upstream-alias', choices: [],
+    usage: { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 30 } } });
+  const router = await startRouter({ handlers: [0, 1, 2].map(() => () => ({ body })) });
+  try {
+    await writeFile(router.clock, String(Date.parse('2026-10-04T00:01:00+08:00')));
+    assert.equal(await (await post(router, { ...CHAT, model: 'Qwen/test' })).text(), body);
+    await waitFor(async () => (await records(router)).length === 1);
+    const report = await usageReport(router, '?from=2026-10-04&account=0&model=Qwen%2Ftest');
+    assert.equal(report.timezone, 'Asia/Shanghai');
+    assert.equal(report.source, 'proxy_response_usage');
+    assert.equal(report.rows.length, 1);
+    assert.equal(report.rows[0].label, 'account-0');
+    assert.equal(report.rows[0].day, '2026-10-04');
+    assert.equal(report.rows[0].model, 'Qwen/test');
+    assert.equal(report.totals.calls, 1);
+    assert.equal(report.totals.usage_reported, 1);
+    assert.deepEqual(report.totals.tokens, { input_tokens: 100, output_tokens: 20, cache_read_tokens: 30, cache_write_tokens: null, total_tokens: 120 });
+    assert.equal((await records(router))[0].usage_status, 'reported');
+    assert.equal((await records(router))[0].usage.input_tokens, 100);
+    const empty = await usageReport(router, '?account=1');
+    assert.equal(empty.rows.length, 0);
+    assert.equal(empty.totals.tokens.input_tokens, null);
+  } finally { await router.close(); }
+});
+
+test('three streaming protocols count cumulative final usage once and preserve all bytes', async () => {
+  const frames = [
+    ['/v1/chat/completions', [
+      { choices: [], usage: { prompt_tokens: 80, completion_tokens: 4 } },
+      { choices: [{ finish_reason: 'stop' }], usage: { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 30 } } },
+      '[DONE]',
+    ]],
+    ['/v1/messages', [
+      { type: 'message_start', message: { usage: { input_tokens: 70, output_tokens: 0, cache_read_input_tokens: 30, cache_creation_input_tokens: 5 } } },
+      { type: 'message_delta', usage: { output_tokens: 10 } },
+      { type: 'message_delta', usage: { output_tokens: 20 } },
+      { type: 'message_stop' },
+    ]],
+    ['/v1/responses', [
+      { type: 'response.created', response: { usage: { input_tokens: 0, output_tokens: 0 } } },
+      { type: 'response.completed', response: { usage: { input_tokens: 100, output_tokens: 20, input_tokens_details: { cached_tokens: 30, cache_write_tokens: 5 } } } },
+    ]],
+  ];
+  for (const [path, values] of frames) {
+    const bytes = values.map(value => 'data: ' + (typeof value === 'string' ? value : JSON.stringify(value)) + '\r\n\r\n').join('');
+    const router = await startRouter({ handlers: [0, 1, 2].map(() => ({ res }) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(bytes.slice(0, 27)); res.end(bytes.slice(27)); return { handled: true };
+    }) });
+    try {
+      const response = await fetch(router.base + path, { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: JSON.stringify({ ...CHAT, stream: true }) });
+      assert.equal(await response.text(), bytes);
+      await waitFor(async () => (await records(router)).length === 1);
+      const report = await usageReport(router);
+      assert.equal(report.totals.calls, 1);
+      assert.equal(report.totals.usage_reported, 1);
+      assert.equal(report.totals.tokens.input_tokens, path === '/v1/messages' ? 105 : 100);
+      assert.equal(report.totals.tokens.output_tokens, 20);
+      assert.equal(report.totals.tokens.cache_read_tokens, 30);
+      assert.equal(router.mocks.reduce((n, m) => n + m.state.calls, 0), 1);
+    } finally { await router.close(); }
+  }
+});
+
+test('missing usage and semantic/unfinished SSE errors are unknown or partial, never full zero usage', async () => {
+  const cases = [
+    { contentType: 'application/json', body: '{"choices":[]}', state: 'unknown', success: 1 },
+    { contentType: 'text/event-stream', body: 'data: {"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\n', state: 'partial', success: 0 },
+    { contentType: 'text/event-stream', body: 'data: {"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\ndata: {"error":{"message":"upstream failed"}}\n\ndata: [DONE]\n\n', state: 'partial', success: 0 },
+    { contentType: 'application/json', body: '{"usage":{"prompt_tokens":-1,"completion_tokens":"2"}}', state: 'unknown', success: 1 },
+  ];
+  for (const item of cases) {
+    const router = await startRouter({ handlers: [0, 1, 2].map(() => ({ res }) => {
+      res.writeHead(200, { 'content-type': item.contentType }); res.end(item.body); return { handled: true };
+    }) });
+    try {
+      assert.equal(await (await post(router, { ...CHAT, stream: item.contentType === 'text/event-stream' })).text(), item.body);
+      await waitFor(async () => (await records(router)).length === 1);
+      const report = await usageReport(router);
+      assert.equal(report.totals['usage_' + item.state], 1);
+      assert.equal(report.totals.success, item.success);
+      assert.equal(report.totals.tokens.input_tokens, null);
+      if (item.state === 'partial') assert.equal(report.totals.partial_tokens.input_tokens, 10);
+    } finally { await router.close(); }
+  }
+});
+
+test('client disconnect keeps observed partial tokens without cross-account replay', async () => {
+  const router = await startRouter({ timeoutMs: 5000, handlers: [0, 1, 2].map(() => ({ res }) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"usage":{"prompt_tokens":100,"completion_tokens":3}}\n\n');
+    return { handled: true };
+  }) });
+  try {
+    const controller = new AbortController();
+    const response = await fetch(router.base + '/v1/chat/completions', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: JSON.stringify({ ...CHAT, stream: true }), signal: controller.signal });
+    await response.body.getReader().read(); controller.abort();
+    await waitFor(async () => (await records(router)).length === 1);
+    const report = await usageReport(router);
+    assert.equal(report.totals.usage_partial, 1);
+    assert.equal(report.totals.partial_tokens.input_tokens, 100);
+    assert.equal(report.totals.tokens.input_tokens, null);
+    assert.equal(report.totals.failed, 1);
+    assert.equal(router.mocks.reduce((n, m) => n + m.state.calls, 0), 1);
+  } finally { await router.close(); }
+});
+
+test('usage query is authenticated, validates filters, survives a new process and retains historical statistics', async () => {
+  let stats;
+  const first = await startRouter({ stats: { '1': { index: 1, days: { '2026-10-03': { attempts: 50, success: 40, retries: 2 } } } },
+    handlers: [0, 1, 2].map(() => () => ({ body: JSON.stringify({ usage: { prompt_tokens: 100, completion_tokens: 20 } }) })) });
+  try {
+    await (await post(first, { ...CHAT, model: '__proto__' })).text();
+    await waitFor(async () => (await records(first)).length === 1);
+    stats = JSON.parse(await readFile(first.files.stats, 'utf8'));
+    assert.equal(stats['1'].days['2026-10-03'].attempts, 50);
+  } finally { await first.close(); }
+  const restored = await startRouter({ stats });
+  try {
+    assert.equal((await fetch(restored.base + '/admin/usage')).status, 401);
+    for (const query of ['?from=2026-02-30', '?from=2026-10-04&to=2026-10-03', '?from=2026-01-01&to=2026-12-31', '?account=3'])
+      assert.equal((await fetch(restored.base + '/admin/usage' + query, { headers: AUTH })).status, 400);
+    const report = await usageReport(restored, '?model=__proto__');
+    assert.equal(report.totals.calls, 1);
+    assert.equal(report.totals.tokens.input_tokens, 100);
+    assert.ok(report.tracking_started_at[1].started_at);
+    await (await fetch(restored.base + '/v1/models', { headers: AUTH })).text();
+    assert.equal((await usageReport(restored)).totals.calls, 1);
+    assert.equal(restored.mocks.reduce((n, m) => n + m.state.calls, 0), 1);
+  } finally { await restored.close(); }
+});
+
+test('real core proxy responses produce equivalent total input usage across three protocols', async () => {
+  const upstreamUsage = { inputTokens: 100, outputTokens: 20, cachedInputTokens: 30, inputTokenDetails: { cacheWriteTokens: 5 } };
+  const proxy = await setup({ ndjson: [
+    JSON.stringify({ type: 'text-delta', text: 'hello' }),
+    JSON.stringify({ type: 'finish-step', finishReason: 'stop', usage: upstreamUsage }),
+    JSON.stringify({ type: 'finish', finishReason: 'stop', totalUsage: upstreamUsage }),
+  ] });
+  const router = await startRouter({ handlers: [0, 1, 2].map(() => async ({ req, res, body }) => {
+    const response = await proxy.proxy.post(req.url, JSON.parse(body), { Authorization: 'Bearer user_test' });
+    res.writeHead(response.status, { 'content-type': response.headers.get('content-type') });
+    res.end(await response.text());
+    return { handled: true };
+  }) });
+  try {
+    const requests = [
+      ['/v1/chat/completions', CHAT],
+      ['/v1/messages', { model: 'm', max_tokens: 30, messages: CHAT.messages }],
+      ['/v1/responses', { model: 'm', input: 'hi' }],
+    ];
+    let completed = 0;
+    for (const [path, body] of requests) for (const stream of [false, true]) {
+      const response = await fetch(router.base + path, { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: JSON.stringify({ ...body, stream }) });
+      assert.equal(response.status, 200);
+      await response.text();
+      completed++;
+      await waitFor(async () => (await records(router)).length === completed);
+      const last = (await records(router)).at(-1);
+      assert.equal(last.usage_status, 'reported', path + ' stream=' + stream);
+      assert.equal(last.usage.input_tokens, 100);
+      assert.equal(last.usage.output_tokens, 20);
+    }
+    const report = await usageReport(router);
+    assert.equal(report.totals.calls, 6);
+    assert.equal(report.totals.tokens.input_tokens, 600);
+    assert.equal(report.totals.tokens.output_tokens, 120);
+    assert.equal(report.totals.tokens.cache_read_tokens, 180);
+    assert.equal(report.totals.tokens.cache_write_tokens, 20);
+    assert.equal(report.totals.token_reports.cache_write_tokens, 4);
+    assert.equal(proxy.mock.generateCount(), 6);
+  } finally { await router.close(); await proxy.close(); }
+});
