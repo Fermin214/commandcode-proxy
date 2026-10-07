@@ -983,10 +983,21 @@ const CC_STATUS_MAP = {
   503: { status: 503, type: 'temporarily_unavailable' },
 };
 
+// Fork extension: preserve only quota metadata, without deciding account routing.
+function quotaMetadata(error) {
+  const q = error?.rateLimit;
+  if (!q || !Number.isFinite(q.limit) || q.limit < 0
+      || !Number.isFinite(q.remaining) || q.remaining < 0
+      || !Number.isSafeInteger(q.reset) || q.reset <= 0
+      || typeof q.window !== 'string' || !/^[a-z]{1,32}$/.test(q.window)) return {};
+  return { rateLimit: { limit: q.limit, remaining: q.remaining, reset: q.reset, window: q.window } };
+}
+
 function mapCcError(ccStatus, ccBody) {
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
   let message = `CC API error (${ccStatus})`;
   let code = null;
+  let quota = {};
 
   if (ccBody) {
     try {
@@ -995,6 +1006,7 @@ function mapCcError(ccStatus, ccBody) {
       // 上游错误体：{"success":false,"error":{"code":"BAD_REQUEST"|"USAGE_EXCEEDED",...}}
       // code 是上游的机器可读错误分类（BAD_REQUEST / USAGE_EXCEEDED 等），透出来便于下游 SDK 与运维判定
       code = parsed.error?.code || parsed.code || null;
+      quota = quotaMetadata(parsed.error || parsed);
     } catch {
       message = ccBody.slice(0, 200) || message;
     }
@@ -1006,18 +1018,19 @@ function mapCcError(ccStatus, ccBody) {
       status: 429,
       code,
       body: {
-        error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) },
+        error: { message, type: 'rate_limit_error', ...(code ? { code } : {}), ...quota },
         retry_after: 30,
       },
     };
   }
 
-  return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
+  return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}), ...quota } } };
 }
 
 function mapCcEventError(event) {
   const message = event.error?.message || event.message || 'Unknown CC error';
   const code = event.error?.code || event.code || null;
+  const quota = quotaMetadata(event.error || event);
   // 上游 error 事件除了 message 还可能自带 statusCode / isRetryable ——
   // CLI 的 readStreamErrorEvent 读的正是这两个字段，取值链是
   //   parseEmbeddedErrorJSON(message)?.status ?? error.statusCode ?? null
@@ -1038,12 +1051,12 @@ function mapCcEventError(event) {
       status: 429,
       code,
       reportedStatus,
-      body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 30 },
+      body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}), ...quota }, retry_after: 30 },
     };
   }
 
   return { status: mapped.status, code, reportedStatus,
-    body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
+    body: { error: { message, type: mapped.type, ...(code ? { code } : {}), ...quota } } };
 }
 
 // ── HTTP 请求处理 ──────────────────────────────────
@@ -2341,8 +2354,9 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   }
 }
 
-function sendAnthropicError(res, status, type, message, retryAfter) {
-  const body = { type: 'error', error: { type, message } };
+function sendAnthropicError(res, status, type, message, retryAfter, sourceError) {
+  const body = { type: 'error', error: { type, message, ...quotaMetadata(sourceError),
+    ...(sourceError?.rateLimit && sourceError.code ? { code: sourceError.code } : {}) } };
   const headers = { 'Content-Type': 'application/json' };
   if (retryAfter !== undefined) {
     body.retry_after = retryAfter;
@@ -2395,7 +2409,7 @@ async function handleMessages(req, res) {
       const errorText = await ccResponse.text().catch(() => '');
       const mapped = mapCcError(ccResponse.status, errorText);
       log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
-      sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
+      sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, undefined, mapped.body.error);
       return;
     }
 
@@ -2488,6 +2502,7 @@ async function handleMessages(req, res) {
                 ctx.upstreamError.status,
                 ctx.upstreamError.body.error.type,
                 ctx.upstreamError.body.error.message,
+                undefined, ctx.upstreamError.body.error,
               );
             }
             // started 时 error 事件已在循环中经 SSE 下发，按规范 error 事件即终结
@@ -2641,7 +2656,7 @@ async function handleMessages(req, res) {
       processLines();
 
       if (upstreamError) {
-        sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message);
+        sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message, undefined, upstreamError.body.error);
         return;
       }
 
@@ -3071,8 +3086,9 @@ function buildResponsesObject(responseId, model, created, fullText, thinkingText
   };
 }
 
-function sendResponsesError(res, status, type, message, retryAfter) {
-  const body = { error: { message, type, code: null, param: null } };
+function sendResponsesError(res, status, type, message, retryAfter, sourceError) {
+  const body = { error: { message, type, code: sourceError?.rateLimit ? sourceError.code || null : null, param: null,
+    ...quotaMetadata(sourceError) } };
   if (retryAfter !== undefined) body.retry_after = retryAfter;
   sendJSON(res, status, body);
 }
@@ -3282,11 +3298,12 @@ function createResponsesSseTranslator(model, responseId, created) {
       }));
       return out;
     },
-    fail(message) {
+    fail(message, sourceError) {
       if (!createdSent) return [];
       return [sse('response.failed', {
         response: Object.assign(baseResponse('failed'), {
-          error: { code: 'upstream_error', message: message || 'Upstream error' },
+          error: { code: sourceError?.rateLimit ? sourceError.code || 'upstream_error' : 'upstream_error',
+            message: message || 'Upstream error', ...quotaMetadata(sourceError) },
         }),
       })];
     },
@@ -3368,7 +3385,7 @@ async function handleResponses(req, res) {
       const errorText = await ccResponse.text().catch(() => '');
       const mapped = mapCcError(ccResponse.status, errorText);
       log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', code: mapped.code, body: summarizeUpstreamError(errorText) });
-      sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
+      sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after, mapped.body.error);
       return;
     }
 
@@ -3442,10 +3459,10 @@ async function handleResponses(req, res) {
             if (!started) {
               sendResponsesError(res, translator.upstreamError.status,
                 translator.upstreamError.body.error.type, translator.upstreamError.body.error.message,
-                translator.upstreamError.body.retry_after);
+                translator.upstreamError.body.retry_after, translator.upstreamError.body.error);
               return;
             }
-            const failed = translator.fail(translator.upstreamError.body.error.message);
+            const failed = translator.fail(translator.upstreamError.body.error.message, translator.upstreamError.body.error);
             if (failed.length) await writeEvents(failed);
           } else if (translator.outputTokens === 0 && !translator.started) {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
@@ -3580,7 +3597,7 @@ async function handleResponses(req, res) {
 
       if (upstreamError) {
         sendResponsesError(res, upstreamError.status, upstreamError.body.error.type,
-          upstreamError.body.error.message, upstreamError.body.retry_after);
+          upstreamError.body.error.message, upstreamError.body.retry_after, upstreamError.body.error);
         return;
       }
 

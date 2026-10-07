@@ -1,7 +1,11 @@
 # Self-hosted account router
 
-The router is a fork-owned deployment layer. `proxy.mjs` and its CommandCode
-protocol conversion remain identical to MAXeaglet upstream.
+The router is a fork-owned deployment layer. `proxy.mjs` follows MAXeaglet
+upstream with one error-metadata extension: validated `error.rateLimit`
+(`limit`, `remaining`, `reset` in Unix seconds, `window`) is retained across
+Chat Completions, Responses and Anthropic JSON/SSE errors. Unrelated provider
+fields are omitted. Existing status mapping and retry hints remain unchanged;
+the proxy itself does not manage account availability.
 
 ## One request, one account
 
@@ -14,10 +18,45 @@ and zero-output results; a status alone cannot establish safe regeneration.
 
 An HTTP 401/403 from the selected internal proxy places that account in a
 five-minute, in-memory cooldown. Only later incoming requests may choose another
-account. Other errors do not affect account selection. When all accounts are
+account. Authentication cooldowns remain in memory. When all accounts are
 cooling down, the router answers 503 without contacting any proxy. Expiration
 allows the ordinary time-slot selection again; restarting clears cooldowns.
 The router's own client-auth rejection does not cool an upstream account.
+
+## Quota exhaustion
+
+A structured error with code `RATE_LIMITED` or `USAGE_EXCEEDED`, a `weekly`
+or `monthly` window, positive limit, zero remaining, and a valid future reset
+temporarily removes that account from selection. The original request is still
+returned unchanged and is never replayed. Only later incoming requests select
+another account. Plain 429s, hourly limits, idle timeouts, zero output, missing
+metadata and expired/invalid reset timestamps do not trigger quota cooldown.
+JSON error bodies and bounded SSE error frames are observed without buffering
+or delaying the response sent to the client.
+
+Quota cooldowns are saved in the ignored `quota-state/accounts.json` directory
+mount, separate from authentication cooldowns and call history. They survive
+router/container restarts and expire when the provider's reset time arrives.
+Saved rows are bound to a SHA-256 digest of the account key, so replacing a key
+does not inherit the previous account's cooldown. Credentials and model text
+are never saved. A malformed state file stops startup rather than silently
+forgetting exhausted accounts; inspect/repair the state file before restarting.
+The directory mount permits atomic file replacement (unlike a single-file
+bind mount). State-write failures are logged; a failed manual-clear write
+returns 503 rather than reporting success.
+
+Two operations use the existing router bearer authentication:
+
+- `GET /admin/accounts`: account labels, availability, quota/reset information
+  and authentication-cooldown expiry; no keys or key digests.
+- `DELETE /admin/accounts/<index>/quota-cooldown`: clear a saved quota cooldown
+  after an upgrade or other confirmed early quota restoration. This does not
+  generate a model request or clear the authentication cooldown.
+
+Quota events and affected request history include only the quota fields and
+account label. All-account unavailability still returns 503 without contacting
+a proxy. Already in-flight requests can finish after a cooldown is discovered.
+Until reset, backup accounts take more traffic and may exhaust their quotas too.
 
 This guarantees one **router-to-proxy** request per incoming request. The
 unmodified upstream `proxy.mjs` still has its own bounded same-account
@@ -70,6 +109,14 @@ Optional router settings:
 | `ROUTER_UPSTREAM_TIMEOUT_MS` | `125000` | Internal connection idle timeout; never authorizes replay |
 | `ROUTER_ACCOUNT_COOLDOWN_MS` | `300000` | Authentication-error cooldown for later requests |
 | `ROUTER_BRIDGE_HOST` | `172.23.0.1` | Additional local listener; loopback in isolated tests |
+| `ROUTER_QUOTA_STATE_FILE` | `/data/quota-state/accounts.json` | Persistent quota state; Compose mounts the containing directory |
+
+For an existing production installation, create `quota-state/` before applying
+the updated Compose file. Rebuild the proxy image and recreate all three proxies
+plus the router, retaining the key, label, history and statistics files. Replace
+temporary fixed-account routing with the normal slots only after the known
+exhausted account is present in quota state. Rollback can restore the preceding
+image, router and Compose file; retain quota state for a subsequent rollout.
 
 Run `node --test test/router.test.mjs` using only local mock servers and fake
 keys. To run the unchanged upstream test suite in a fresh fork checkout, first

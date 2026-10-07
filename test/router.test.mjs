@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
+import { setup } from './helpers.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const AUTH = { Authorization: 'Bearer client-test' };
@@ -55,12 +57,17 @@ async function startRouter(options = {}) {
     const files = {
       keys: join(dir, 'keys'), labels: join(dir, 'labels.json'), state: join(dir, 'last.json'),
       stats: join(dir, 'stats.json'), history: join(historyDir, 'history.jsonl'),
+      quota: join(dir, 'quota-state', 'accounts.json'),
     };
     await writeFile(files.keys, 'key-a\nkey-b\nkey-c\n');
     await writeFile(files.labels, JSON.stringify([0, 1, 2].map(index => ({ index, label: `account-${index}`, proxy: `proxy-${index}`, port: mocks[index].port }))));
     await writeFile(files.state, '{}\n');
     await writeFile(files.stats, JSON.stringify(options.stats || {}));
     await writeFile(files.history, '');
+    if (options.quota) {
+      await mkdir(join(dir, 'quota-state'));
+      await writeFile(files.quota, JSON.stringify(options.quota));
+    }
     await writeFile(join(dir, 'client-key'), 'client-test\n');
     // A process-local test clock exercises the real slot/retention code without runtime test switches.
     const clock = join(dir, 'clock');
@@ -87,6 +94,7 @@ async function startRouter(options = {}) {
       env: { ...process.env, PORT: String(routerPort), ROUTER_PORTS: mocks.map(m => m.port).join(','), ROUTER_KEYS_FILE: files.keys,
         ROUTER_CLIENT_KEY_FILE: join(dir, 'client-key'), ROUTER_LABELS_FILE: files.labels, ROUTER_STATE_FILE: files.state,
         ROUTER_STATS_FILE: files.stats, ROUTER_HISTORY_FILE: files.history, ROUTER_HISTORY_DIR: historyDir,
+        ROUTER_QUOTA_STATE_FILE: files.quota,
         ROUTER_BRIDGE_HOST: '127.0.0.2', ROUTER_UPSTREAM_TIMEOUT_MS: String(options.timeoutMs ?? 1000),
         ROUTER_ACCOUNT_COOLDOWN_MS: '60000' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -352,5 +360,117 @@ test('an account rejected on one request is cooled down for the next new request
     assert.equal((await post(router, CHAT)).status, 200);
     assert.equal(router.mocks.filter(m => m.state.calls).length, 2);
     assert.match(router.logs(), /account_cooldown/);
+  } finally { await router.close(); }
+});
+
+const quotaReset = Date.parse('2026-10-04T12:01:00+08:00') / 1000;
+const quotaError = { code: 'RATE_LIMITED', message: 'Weekly usage limit reached',
+  rateLimit: { limit: 6, remaining: 0, reset: quotaReset, window: 'weekly' } };
+
+test('real proxy quota rejection is not replayed; only the next request changes account', async () => {
+  const proxy = await setup({ status: 429, errorBody: JSON.stringify({ error: quotaError }) });
+  const router = await startRouter({ handlers: [undefined, async ({ body }) => {
+    const response = await proxy.proxy.post('/v1/chat/completions', JSON.parse(body), { Authorization: 'Bearer user_test' });
+    return { status: response.status, body: await response.text() };
+  }] });
+  try {
+    const first = await post(router, { ...CHAT, stream: true });
+    assert.equal(first.status, 429);
+    assert.deepEqual((await first.json()).error.rateLimit, quotaError.rateLimit);
+    await waitFor(() => router.logs().includes('quota_cooldown'));
+    assert.deepEqual(router.mocks.map(m => m.state.calls), [0, 1, 0]);
+    assert.equal(proxy.mock.generateCount(), 1);
+    assert.equal((await post(router, CHAT)).status, 200);
+    assert.deepEqual(router.mocks.map(m => m.state.calls), [0, 1, 1]);
+    const saved = JSON.parse(await readFile(router.files.quota, 'utf8'));
+    assert.equal(saved['1'].until, quotaReset * 1000);
+    assert.equal(saved['1'].key_id, createHash('sha256').update('key-b').digest('hex'));
+    const accounts = await (await fetch(router.base + '/admin/accounts', { headers: AUTH })).json();
+    assert.equal(accounts.accounts[1].available, false);
+    assert.equal(accounts.accounts[1].quota.rateLimit.window, 'weekly');
+    assert.ok(!JSON.stringify(accounts).includes('key_id'));
+    await waitFor(async () => (await records(router)).length === 2);
+    assert.deepEqual((await records(router))[0].quota.rateLimit, quotaError.rateLimit);
+  } finally { await router.close(); await proxy.close(); }
+});
+
+test('SSE quota error in HTTP 200 marks future requests without changing streamed bytes', async () => {
+  const bytes = 'event: response.failed\r\ndata: ' + JSON.stringify({ response: { error: quotaError } }) + '\r\n\r\n';
+  const router = await startRouter({ handlers: [undefined, ({ res }) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    // Split the frame delimiter across chunks to exercise the incremental observer.
+    res.write(bytes.slice(0, -2)); setTimeout(() => res.end(bytes.slice(-2)), 20);
+    return { handled: true };
+  }] });
+  try {
+    const response = await post(router, { ...CHAT, stream: true });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), bytes);
+    await waitFor(() => router.logs().includes('quota_cooldown'));
+    assert.equal((await post(router, CHAT)).status, 200);
+    assert.deepEqual(router.mocks.map(m => m.state.calls), [0, 1, 1]);
+  } finally { await router.close(); }
+});
+
+test('ambiguous, temporary and invalid 429 quota signals do not disable accounts', async () => {
+  const errors = [
+    { ...quotaError, rateLimit: undefined },
+    { ...quotaError, code: 'UNKNOWN' },
+    { ...quotaError, rateLimit: { ...quotaError.rateLimit, window: 'hourly' } },
+    { ...quotaError, rateLimit: { ...quotaError.rateLimit, remaining: 1 } },
+    { ...quotaError, rateLimit: { ...quotaError.rateLimit, reset: 1 } },
+    { ...quotaError, rateLimit: { ...quotaError.rateLimit, reset: String(quotaReset) } },
+  ];
+  let next = 0;
+  const router = await startRouter({ handlers: [undefined, () => ({ status: 429, body: JSON.stringify({ error: errors[next++] }) })] });
+  try {
+    for (const error of errors) assert.equal((await post(router, CHAT)).status, 429);
+    assert.deepEqual(router.mocks.map(m => m.state.calls), [0, errors.length, 0]);
+    assert.doesNotMatch(router.logs(), /quota_cooldown/);
+  } finally { await router.close(); }
+});
+
+test('saved quota survives a new process, expires automatically, and can be cleared with authentication', async () => {
+  let saved;
+  const first = await startRouter({ handlers: [undefined, () => ({ status: 429, body: JSON.stringify({ error: quotaError }) })] });
+  try {
+    await (await post(first, CHAT)).text();
+    await waitFor(() => first.logs().includes('quota_cooldown'));
+    saved = JSON.parse(await readFile(first.files.quota, 'utf8'));
+  } finally { await first.close(); }
+  const restored = await startRouter({ quota: saved });
+  try {
+    assert.equal((await post(restored, CHAT)).status, 200);
+    assert.deepEqual(restored.mocks.map(m => m.state.calls), [0, 0, 1]);
+    assert.equal((await fetch(restored.base + '/admin/accounts')).status, 401);
+    assert.equal((await fetch(restored.base + '/admin/accounts/1/quota-cooldown', { method: 'DELETE' })).status, 401);
+    assert.equal((await fetch(restored.base + '/admin/accounts/1/quota-cooldown', { method: 'DELETE', headers: AUTH })).status, 204);
+    assert.equal((await post(restored, CHAT)).status, 200);
+    assert.deepEqual(restored.mocks.map(m => m.state.calls), [0, 1, 1]);
+    assert.deepEqual(JSON.parse(await readFile(restored.files.quota, 'utf8')), {});
+  } finally { await restored.close(); }
+  const expired = await startRouter({ quota: saved });
+  try {
+    await writeFile(expired.clock, String(quotaReset * 1000));
+    assert.equal((await post(expired, CHAT)).status, 200);
+    assert.deepEqual(expired.mocks.map(m => m.state.calls), [0, 1, 0]);
+    assert.deepEqual(JSON.parse(await readFile(expired.files.quota, 'utf8')), {});
+  } finally { await expired.close(); }
+  const replacedKey = await startRouter({ quota: { '1': { ...saved['1'], key_id: 'different-key' } } });
+  try {
+    assert.equal((await post(replacedKey, CHAT)).status, 200);
+    assert.deepEqual(replacedKey.mocks.map(m => m.state.calls), [0, 1, 0]);
+  } finally { await replacedKey.close(); }
+});
+
+test('all quota-exhausted accounts reject new requests without calling a proxy', async () => {
+  const router = await startRouter({ handlers: [0, 1, 2].map(() => () => ({ status: 429, body: JSON.stringify({ error: quotaError }) })) });
+  try {
+    for (let i = 0; i < 3; i++) {
+      await (await post(router, CHAT)).text();
+      await waitFor(() => (router.logs().match(/"event":"quota_cooldown"/g) || []).length === i + 1);
+    }
+    assert.equal((await post(router, CHAT)).status, 503);
+    assert.deepEqual(router.mocks.map(m => m.state.calls), [1, 1, 1]);
   } finally { await router.close(); }
 });

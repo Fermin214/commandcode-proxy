@@ -2,6 +2,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 const { randomUUID } = crypto;
 import fs from 'node:fs';
+import path from 'node:path';
 
 const keys = fs.readFileSync(process.env.ROUTER_KEYS_FILE || '/data/user-keys.txt', 'utf8')
   .split(/\r?\n/).map(s => s.trim()).filter(Boolean);
@@ -64,7 +65,7 @@ function recordAccountCall(index, fields) {
   const dayStats = stats.days[day] || { attempts: 0, success: 0, retries: 0, timeouts: 0, http_errors: 0, last_started_at: null, last_finished_at: null };
   dayStats.attempts += 1;
   if (fields.retry) dayStats.retries += 1;
-  if (fields.status !== null && fields.status >= 200 && fields.status < 300 && !fields.error) dayStats.success += 1;
+  if (fields.status !== null && fields.status >= 200 && fields.status < 300 && !fields.error && !fields.quota) dayStats.success += 1;
   if (fields.error && /timeout/i.test(fields.error)) dayStats.timeouts += 1;
   if (fields.status !== null && fields.status >= 400) dayStats.http_errors += 1;
   dayStats.last_started_at = fields.started_at; dayStats.last_finished_at = fields.finished_at;
@@ -88,6 +89,56 @@ const accountCooldownMs = Number.parseInt(process.env.ROUTER_ACCOUNT_COOLDOWN_MS
   ? Number.parseInt(process.env.ROUTER_ACCOUNT_COOLDOWN_MS, 10) : 5 * 60 * 1000;
 const hosts = ports.map(port => `http://127.0.0.1:${port}`);
 const accountCooldownUntil = new Map();
+const quotaStateFile = process.env.ROUTER_QUOTA_STATE_FILE || '/data/quota-state/accounts.json';
+const accountQuotaCooldown = new Map();
+const keyId = index => crypto.createHash('sha256').update(keys[index]).digest('hex');
+fs.mkdirSync(path.dirname(quotaStateFile), { recursive: true });
+if (fs.existsSync(quotaStateFile)) {
+  const saved = JSON.parse(fs.readFileSync(quotaStateFile, 'utf8'));
+  for (const [key, value] of Object.entries(saved)) {
+    const index = Number(key);
+    if (Number.isInteger(index) && index >= 0 && index < accountCount
+        && value?.key_id === keyId(index) && quotaExhausted(value, value.until)) {
+      accountQuotaCooldown.set(index, value);
+    }
+  }
+}
+function quotaExhausted(error, until = error?.rateLimit?.reset * 1000) {
+  const q = error?.rateLimit;
+  return ['RATE_LIMITED', 'USAGE_EXCEEDED'].includes(error?.code)
+    && ['weekly', 'monthly'].includes(q?.window)
+    && Number.isFinite(q.limit) && q.limit > 0 && q.remaining === 0
+    && Number.isSafeInteger(q.reset) && until === q.reset * 1000
+    && Number.isSafeInteger(until) && until > Date.now() && until <= 8640000000000000;
+}
+function saveQuotaCooldowns() {
+  const temporary = quotaStateFile + '.tmp';
+  fs.writeFileSync(temporary, JSON.stringify(Object.fromEntries(accountQuotaCooldown), null, 2) + '\n');
+  fs.renameSync(temporary, quotaStateFile);
+}
+function quotaCooldown(index) {
+  const saved = accountQuotaCooldown.get(index);
+  if (!saved || saved.until > Date.now()) return saved;
+  accountQuotaCooldown.delete(index);
+  try { saveQuotaCooldowns(); }
+  catch (error) { log('warn', { event: 'quota_state_write_failed', error: error.message }); }
+  log('quota_reset', { account: accountMeta(index).label });
+  return null;
+}
+function observeQuota(index, error, requestId) {
+  if (!quotaExhausted(error)) return null;
+  const old = accountQuotaCooldown.get(index);
+  if (old?.until === error.rateLimit.reset * 1000) return old;
+  const value = { key_id: keyId(index), code: error.code,
+    rateLimit: { limit: error.rateLimit.limit, remaining: 0, reset: error.rateLimit.reset, window: error.rateLimit.window },
+    until: error.rateLimit.reset * 1000 };
+  accountQuotaCooldown.set(index, value);
+  try { saveQuotaCooldowns(); }
+  catch (error) { log('warn', { event: 'quota_state_write_failed', error: error.message }); }
+  log('quota_cooldown', { request_id: requestId, account: accountMeta(index).label,
+    code: value.code, rate_limit: value.rateLimit, until: new Date(value.until).toISOString() });
+  return value;
+}
 function slot(now = new Date()) {
   const h = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Shanghai', hour: 'numeric', hour12: false }).format(now)) % 24;
   return Math.floor(h / 8) % accountCount;
@@ -113,7 +164,7 @@ function selectAccount(primary) {
   const now = Date.now();
   for (let offset = 0; offset < accountCount; offset++) {
     const index = (primary + offset) % accountCount;
-    if ((accountCooldownUntil.get(index) || 0) <= now) return index;
+    if (!quotaCooldown(index) && (accountCooldownUntil.get(index) || 0) <= now) return index;
   }
   return null;
 }
@@ -164,19 +215,47 @@ function forward(req, res, index, body, requestId, state, nonStream) {
       const status = upstreamRes.statusCode || 502;
       markAccountUnavailable(index, status, requestId);
       // Observe a bounded copy for correlation; the response itself remains a byte-for-byte pipe.
-      let chunks = nonStream && /^application\/json\b/i.test(upstreamRes.headers['content-type'] || '')
+      let chunks = (nonStream || status === 429) && /^application\/json\b/i.test(upstreamRes.headers['content-type'] || '')
         && (!upstreamRes.headers['content-encoding'] || upstreamRes.headers['content-encoding'] === 'identity') ? [] : null;
       let capturedBytes = 0;
+      // Inspect bounded SSE frames without buffering/delaying the forwarded stream.
+      const isSse = /^text\/event-stream\b/i.test(upstreamRes.headers['content-type'] || '')
+        && !upstreamRes.headers['content-encoding'];
+      const decoder = new TextDecoder();
+      let sseBuffer = '';
+      let dropFrame = false;
+      let observedQuota = null;
       upstreamRes.on('data', chunk => {
+        if (isSse) {
+          sseBuffer += decoder.decode(chunk, { stream: true });
+          const frames = sseBuffer.split(/\r?\n\r?\n/);
+          sseBuffer = frames.pop();
+          for (const frame of frames) {
+            if (!dropFrame && frame.length <= 65536) {
+              const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:'))
+                .map(line => line.slice(5).trimStart()).join('\n');
+              try {
+                const parsed = JSON.parse(data);
+                observedQuota = observeQuota(index, parsed.error || parsed.response?.error, requestId) || observedQuota;
+              } catch {}
+            }
+            dropFrame = false;
+          }
+          if (sseBuffer.length > 65536) { sseBuffer = sseBuffer.slice(-3); dropFrame = true; }
+        }
         if (!chunks) return;
         capturedBytes += chunk.length;
         if (capturedBytes > 2 * 1024 * 1024) { chunks = null; return; }
         chunks.push(chunk);
       });
-      upstreamRes.on('end', () => finish({
-        status,
-        responseId: chunks ? responseIdFrom(Buffer.concat(chunks)) : null,
-      }));
+      upstreamRes.on('end', () => {
+        const captured = chunks ? Buffer.concat(chunks) : null;
+        if (status === 429 && captured) {
+          try { observedQuota = observeQuota(index, JSON.parse(captured.toString('utf8')).error, requestId); } catch {}
+        }
+        finish({ status, responseId: nonStream && captured ? responseIdFrom(captured) : null,
+          quota: observedQuota ? { code: observedQuota.code, rateLimit: observedQuota.rateLimit } : null });
+      });
       upstreamRes.on('error', error => finish({ status, error: error.message }));
       res.writeHead(status, { ...upstreamRes.headers, 'x-request-id': requestId });
       upstreamRes.pipe(res);
@@ -199,6 +278,35 @@ const server = http.createServer(async (req, res) => {
   if (!authorized(req)) { res.writeHead(401, {'content-type':'application/json'}); res.end(JSON.stringify({error:{type:'auth_error',message:'invalid router key'}})); return; }
   const requestId = requestIdFrom(req);
   res.setHeader('x-request-id', requestId);
+  if (req.url === '/admin/accounts' && req.method === 'GET') {
+    const accounts = Array.from({ length: accountCount }, (_, index) => {
+      const quota = quotaCooldown(index);
+      const authUntil = accountCooldownUntil.get(index) || 0;
+      return { ...accountMeta(index), available: !quota && authUntil <= Date.now(),
+        quota: quota ? { code: quota.code, rateLimit: quota.rateLimit, until: new Date(quota.until).toISOString() } : null,
+        auth_cooldown_until: authUntil > Date.now() ? new Date(authUntil).toISOString() : null };
+    });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ accounts }));
+    return;
+  }
+  const clearQuota = req.url.match(/^\/admin\/accounts\/(\d+)\/quota-cooldown$/);
+  if (clearQuota && req.method === 'DELETE') {
+    const index = Number(clearQuota[1]);
+    if (index >= accountCount) { res.writeHead(404); res.end(); return; }
+    const previous = accountQuotaCooldown.get(index);
+    accountQuotaCooldown.delete(index);
+    try { saveQuotaCooldowns(); }
+    catch (error) {
+      if (previous) accountQuotaCooldown.set(index, previous);
+      log('warn', { event: 'quota_state_write_failed', error: error.message });
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'upstream_error', message: 'could not save quota state' } }));
+      return;
+    }
+    log('quota_cooldown_cleared', { request_id: requestId, account: accountMeta(index).label });
+    res.writeHead(204); res.end(); return;
+  }
   const primary = slot();
   const index = selectAccount(primary);
   if (index === null) {
@@ -244,7 +352,8 @@ const server = http.createServer(async (req, res) => {
   res.off('close', onClientClose);
   req.off('aborted', onClientClose);
   const finishedAt = new Date();
-  const fields = { request_id: requestId, router_request_id: requestId, started_at: startedAt.toISOString(), finished_at: finishedAt.toISOString(), duration_ms: Date.now() - startedMs, status: last.status ?? null, retry: false, error: state.clientDisconnected ? 'client disconnected' : last.error || null, response_id: last.responseId || null, model: requestMeta.model, stream: requestMeta.stream, method: req.method, path: req.url };
+  const fields = { request_id: requestId, router_request_id: requestId, started_at: startedAt.toISOString(), finished_at: finishedAt.toISOString(), duration_ms: Date.now() - startedMs, status: last.status ?? null, retry: false, error: state.clientDisconnected ? 'client disconnected' : last.error || null, response_id: last.responseId || null, model: requestMeta.model, stream: requestMeta.stream, method: req.method, path: req.url,
+    ...(last.quota ? { quota: last.quota } : {}) };
   log('attempt', { scheduled: primary, scheduled_account: accountMeta(primary).label, actual: index, account: accountMeta(index).label, proxy: accountMeta(index).proxy, ...fields });
   recordAccountCall(index, fields);
 });

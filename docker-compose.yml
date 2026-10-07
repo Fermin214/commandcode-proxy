@@ -59,6 +59,7 @@ services:
       ROUTER_HISTORY_DIR: /data/account-history
       ROUTER_HISTORY_RETENTION_DAYS: "90"
       ROUTER_STATS_FILE: /data/account-stats.json
+      ROUTER_QUOTA_STATE_FILE: /data/quota-state/accounts.json
       ROUTER_PORTS: 3051,3052,3053
     volumes:
       - ./router.mjs:/app/router.mjs:ro
@@ -68,6 +69,7 @@ services:
       - ./account-last-call.json:/data/account-last-call.json
       - ./account-history:/data/account-history
       - ./account-stats.json:/data/account-stats.json
+      - ./quota-state:/data/quota-state
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "http://127.0.0.1:3060/health"]
