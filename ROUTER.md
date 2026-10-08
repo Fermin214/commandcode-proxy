@@ -11,6 +11,10 @@ the proxy itself does not manage account availability.
 
 The primary account rotates in Beijing time: account 0 at 00:00-07:59,
 account 1 at 08:00-15:59, and account 2 at 16:00-23:59.
+Set `ROUTER_PRIMARY_ACCOUNT` to an account index (0, 1, or 2) to pin the primary
+for a temporary deployment. Other available accounts remain backups. Quota
+reset, clock changes and restarts do not remove this override; only an explicit
+configuration change restores time-slot rotation. Invalid indices stop startup.
 Every incoming request is forwarded once to the account chosen before sending.
 HTTP 429/5xx, connection errors and timeouts never replay that request on another
 account. This matters because the inner proxy also uses 429 for idle timeouts
@@ -47,7 +51,7 @@ returns 503 rather than reporting success.
 
 Two operations use the existing router bearer authentication:
 
-- `GET /admin/accounts`: account labels, availability, quota/reset information
+- `GET /admin/accounts`: routing mode/current primary, account labels, availability, quota/reset information
   and authentication-cooldown expiry; no keys or key digests.
 - `DELETE /admin/accounts/<index>/quota-cooldown`: clear a saved quota cooldown
   after an upgrade or other confirmed early quota restoration. This does not

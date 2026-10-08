@@ -93,6 +93,11 @@ const clientKey = process.env.ROUTER_CLIENT_KEY || fs.readFileSync(process.env.R
 if (!clientKey) throw new Error('router client key is required');
 const ports = (process.env.ROUTER_PORTS || '3051,3052,3053').split(',').map(Number);
 const accountCount = Math.min(keys.length, ports.length);
+const primaryOverride = process.env.ROUTER_PRIMARY_ACCOUNT;
+const fixedPrimary = primaryOverride === undefined || primaryOverride === '' ? null : Number(primaryOverride);
+if (fixedPrimary !== null && (!/^\d+$/.test(primaryOverride) || !Number.isInteger(fixedPrimary) || fixedPrimary >= accountCount)) {
+  throw new Error('ROUTER_PRIMARY_ACCOUNT must be an available account index');
+}
 const listenPort = Number(process.env.PORT || 3060);
 const bridgeHost = process.env.ROUTER_BRIDGE_HOST || '172.23.0.1';
 const upstreamTimeoutMs = Number.parseInt(process.env.ROUTER_UPSTREAM_TIMEOUT_MS || '', 10) > 0
@@ -152,6 +157,7 @@ function observeQuota(index, error, requestId) {
   return value;
 }
 function slot(now = new Date()) {
+  if (fixedPrimary !== null) return fixedPrimary;
   const h = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Shanghai', hour: 'numeric', hour12: false }).format(now)) % 24;
   return Math.floor(h / 8) % accountCount;
 }
@@ -345,7 +351,7 @@ const server = http.createServer(async (req, res) => {
         auth_cooldown_until: authUntil > Date.now() ? new Date(authUntil).toISOString() : null };
     });
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ accounts }));
+    res.end(JSON.stringify({ routing: { mode: fixedPrimary === null ? 'time-slot' : 'fixed-primary', primary: slot() }, accounts }));
     return;
   }
   const clearQuota = req.url.match(/^\/admin\/accounts\/(\d+)\/quota-cooldown$/);

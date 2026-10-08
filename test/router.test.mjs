@@ -96,7 +96,7 @@ async function startRouter(options = {}) {
         ROUTER_STATS_FILE: files.stats, ROUTER_HISTORY_FILE: files.history, ROUTER_HISTORY_DIR: historyDir,
         ROUTER_QUOTA_STATE_FILE: files.quota,
         ROUTER_BRIDGE_HOST: '127.0.0.2', ROUTER_UPSTREAM_TIMEOUT_MS: String(options.timeoutMs ?? 1000),
-        ROUTER_ACCOUNT_COOLDOWN_MS: '60000' },
+        ROUTER_ACCOUNT_COOLDOWN_MS: '60000', ROUTER_PRIMARY_ACCOUNT: options.primary === undefined ? '' : String(options.primary) },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const logs = [];
@@ -127,6 +127,32 @@ async function post(router, body, headers = {}) {
   return fetch(`${router.base}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', ...AUTH, ...headers }, body: JSON.stringify(body) });
 }
 const CHAT = { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false };
+test('fixed primary survives time-slot changes and backup quota reset', async () => {
+  const reset = Date.parse('2026-10-05T00:00:00+08:00');
+  const router = await startRouter({ primary: 0, quota: { '1': {
+    code: 'RATE_LIMITED', rateLimit: { window: 'weekly', limit: 5, remaining: 0, reset: reset / 1000 },
+    until: reset, key_id: createHash('sha256').update('key-b').digest('hex'),
+  } } });
+  try {
+    for (const now of ['2026-10-04T01:00:00+08:00', '2026-10-04T20:00:00+08:00', '2026-10-05T12:00:00+08:00']) {
+      await writeFile(router.clock, String(Date.parse(now)));
+      assert.equal((await post(router, CHAT)).status, 200);
+    }
+    const info = await (await fetch(router.base + '/admin/accounts', { headers: AUTH })).json();
+    assert.deepEqual(info.routing, { mode: 'fixed-primary', primary: 0 });
+    assert.equal(info.accounts[1].available, true);
+    assert.deepEqual(router.mocks.map(m => m.state.calls), [3, 0, 0]);
+  } finally { await router.close(); }
+});
+test('fixed primary uses a backup only on a later request after unavailability', async () => {
+  const router = await startRouter({ primary: 0, handlers: [() => ({ status: 401 })] });
+  try {
+    assert.equal((await post(router, CHAT)).status, 401);
+    assert.deepEqual(router.mocks.map(m => m.state.calls), [1, 0, 0]);
+    assert.equal((await post(router, CHAT)).status, 200);
+    assert.deepEqual(router.mocks.map(m => m.state.calls), [1, 1, 0]);
+  } finally { await router.close(); }
+});
 async function waitFor(predicate) {
   for (let i = 0; i < 100; i++) { if (await predicate()) return; await sleep(20); }
   assert.fail('condition did not become true');
